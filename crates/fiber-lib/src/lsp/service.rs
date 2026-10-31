@@ -341,6 +341,11 @@ impl Actor for LspService {
         );
         let supervisor =
             TenantSupervisor::new(args.runtime_factory.clone(), args.config.max_active_tenants);
+        // Deliveries written by a binary before the pending index have no entry in it.
+        let pending = delivery_manager
+            .index_pending()
+            .map_err(anyhow::Error::msg)?;
+        tracing::info!(pending, "Indexed pending hosted payment deliveries");
         for delivery in delivery_manager
             .list_pending()
             .map_err(anyhow::Error::msg)?

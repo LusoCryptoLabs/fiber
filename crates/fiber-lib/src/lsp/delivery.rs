@@ -9,6 +9,10 @@ use super::{LspInvoiceRegistration, TenantChannelRecord, TenantId, TrampolineFor
 
 const PAYMENT_DELIVERY_PREFIX: &[u8] = b"\xf2lsp/delivery/";
 const PAYMENT_DELIVERY_HASH_INDEX_PREFIX: &[u8] = b"\xf2lsp/delivery-by-hash/";
+/// One empty entry for each delivery not final yet. A delivery is kept for every hosted payment
+/// and never removed, so reading all of them to find the pending ones grew with every payment:
+/// 8,980 took 35 ms a read, in the service actor, at each payment, tenant back and eviction.
+const PAYMENT_DELIVERY_PENDING_PREFIX: &[u8] = b"\xf2lsp/delivery-pending/";
 /// Time retained between the end of buffering and the downstream expiry budget.
 pub const LSP_DELIVERY_SAFETY_MARGIN_MS: u64 = 30_000;
 
@@ -178,6 +182,19 @@ pub trait LspPaymentDeliveryStore: Clone + Send + Sync + 'static {
         &self,
         payment_hash: &Hash256,
     ) -> Result<Vec<LspPaymentDelivery>, String>;
+    /// The deliveries not final yet.
+    fn list_pending_lsp_payment_deliveries(&self) -> Result<Vec<LspPaymentDelivery>, String> {
+        Ok(self
+            .list_lsp_payment_deliveries()?
+            .into_iter()
+            .filter(|delivery| !delivery.status.is_final())
+            .collect())
+    }
+    /// Makes the pending index match the deliveries kept, for a store written before it; the
+    /// number of pending deliveries.
+    fn index_pending_lsp_payment_deliveries(&self) -> Result<usize, String> {
+        Ok(self.list_pending_lsp_payment_deliveries()?.len())
+    }
 }
 
 fn append_execution_key(bytes: &mut Vec<u8>, key: &LspPaymentDeliveryKey) {
@@ -188,6 +205,13 @@ fn append_execution_key(bytes: &mut Vec<u8>, key: &LspPaymentDeliveryKey) {
 fn delivery_key(key: &LspPaymentDeliveryKey) -> Vec<u8> {
     let mut bytes = Vec::with_capacity(PAYMENT_DELIVERY_PREFIX.len() + 40);
     bytes.extend_from_slice(PAYMENT_DELIVERY_PREFIX);
+    append_execution_key(&mut bytes, key);
+    bytes
+}
+
+fn pending_key(key: &LspPaymentDeliveryKey) -> Vec<u8> {
+    let mut bytes = Vec::with_capacity(PAYMENT_DELIVERY_PENDING_PREFIX.len() + 40);
+    bytes.extend_from_slice(PAYMENT_DELIVERY_PENDING_PREFIX);
     append_execution_key(&mut bytes, key);
     bytes
 }
@@ -203,7 +227,13 @@ fn payment_hash_index_key(payment_hash: &Hash256, key: &LspPaymentDeliveryKey) -
 }
 
 fn parse_indexed_execution_key(bytes: &[u8]) -> Result<LspPaymentDeliveryKey, String> {
-    let key_offset = PAYMENT_DELIVERY_HASH_INDEX_PREFIX.len() + 32;
+    parse_execution_key_at(bytes, PAYMENT_DELIVERY_HASH_INDEX_PREFIX.len() + 32)
+}
+
+fn parse_execution_key_at(
+    bytes: &[u8],
+    key_offset: usize,
+) -> Result<LspPaymentDeliveryKey, String> {
     if bytes.len() != key_offset + 40 {
         return Err(format!(
             "invalid hosted payment delivery index key length: {}",
@@ -239,8 +269,44 @@ impl LspPaymentDeliveryStore for Store {
         let mut batch = self.batch();
         batch.put(delivery_key(&key), bytes);
         batch.put(payment_hash_index_key(&delivery.payment_hash, &key), []);
+        if delivery.status.is_final() {
+            batch.delete(pending_key(&key));
+        } else {
+            batch.put(pending_key(&key), []);
+        }
         batch.commit();
         Ok(())
+    }
+
+    fn list_pending_lsp_payment_deliveries(&self) -> Result<Vec<LspPaymentDelivery>, String> {
+        let mut pending = Vec::new();
+        for pair in self.collect_by_prefix(PAYMENT_DELIVERY_PENDING_PREFIX) {
+            let key = parse_execution_key_at(&pair.key, PAYMENT_DELIVERY_PENDING_PREFIX.len())?;
+            if let Some(delivery) = self.get_lsp_payment_delivery(&key)? {
+                if !delivery.status.is_final() {
+                    pending.push(delivery);
+                }
+            }
+        }
+        Ok(pending)
+    }
+
+    fn index_pending_lsp_payment_deliveries(&self) -> Result<usize, String> {
+        let deliveries = self.list_lsp_payment_deliveries()?;
+        let mut batch = self.batch();
+        for pair in self.collect_by_prefix(PAYMENT_DELIVERY_PENDING_PREFIX) {
+            batch.delete(pair.key);
+        }
+        let mut pending = 0;
+        for delivery in deliveries
+            .iter()
+            .filter(|delivery| !delivery.status.is_final())
+        {
+            batch.put(pending_key(&delivery.key()), []);
+            pending += 1;
+        }
+        batch.commit();
+        Ok(pending)
     }
 
     fn list_lsp_payment_deliveries(&self) -> Result<Vec<LspPaymentDelivery>, String> {
@@ -339,12 +405,12 @@ impl<S: LspPaymentDeliveryStore> LspPaymentDeliveryManager<S> {
     }
 
     pub fn list_pending(&self) -> Result<Vec<LspPaymentDelivery>, String> {
-        Ok(self
-            .store
-            .list_lsp_payment_deliveries()?
-            .into_iter()
-            .filter(|delivery| !delivery.status.is_final())
-            .collect())
+        self.store.list_pending_lsp_payment_deliveries()
+    }
+
+    /// Rebuilds the index of pending deliveries from every delivery kept (once, at start).
+    pub fn index_pending(&self) -> Result<usize, String> {
+        self.store.index_pending_lsp_payment_deliveries()
     }
 
     pub fn has_pending_for_tenant(&self, tenant_id: &TenantId) -> Result<bool, String> {

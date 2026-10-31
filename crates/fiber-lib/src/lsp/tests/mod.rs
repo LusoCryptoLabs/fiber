@@ -32,7 +32,7 @@ use crate::lsp::{
     TenantSupervisor, DEFAULT_LSP_BUFFER_DURATION_MS, LSP_DELIVERY_SAFETY_MARGIN_MS,
     MAX_LSP_BUFFER_DURATION_MS,
 };
-use crate::store::{open_store, NodeNamespace, Store};
+use crate::store::{open_store, FiberStore, NodeNamespace, Store};
 
 #[cfg(not(target_arch = "wasm32"))]
 mod integration;
@@ -895,6 +895,138 @@ fn payment_delivery_uses_selected_tenant_channel_and_rejects_asset_mismatch() {
     assert!(
         error.contains("asset does not match"),
         "unexpected error: {error}"
+    );
+}
+
+/// Three deliveries for one tenant, accepted at `now`, and the store they are kept in.
+fn three_deliveries(
+    root: &std::path::Path,
+) -> (
+    Store,
+    LspPaymentDeliveryManager<Store>,
+    TenantId,
+    Vec<crate::lsp::LspPaymentDelivery>,
+    u64,
+) {
+    let config = lsp_config(root.join("lsp"));
+    let store = open_lsp_store(&config);
+    let invoices = LspInvoiceRegistry::new(store.clone());
+    let deliveries = LspPaymentDeliveryManager::new(store.clone());
+    let tenant_key = Privkey::from(&[3; 32]);
+    let lsp_key = Privkey::from(&[9; 32]);
+    let tenant = HostedTenantRecord {
+        tenant_id: TenantId::new("u1").unwrap(),
+        root_signer_pubkey: None,
+        tenant_pubkey: tenant_key.pubkey(),
+        created_at: 42,
+    };
+    let now = crate::now_timestamp_as_millis_u64();
+    let made = (0..3u8)
+        .map(|i| {
+            let payment_hash = Hash256::from([40 + i; 32]);
+            let registration = invoices
+                .register(
+                    &tenant,
+                    signed_invoice(&tenant_key, payment_hash),
+                    None,
+                    lsp_key.pubkey(),
+                    &lsp_key,
+                )
+                .unwrap();
+            deliveries
+                .accept(
+                    &registration,
+                    &tenant,
+                    Hash256::from([23; 32]),
+                    hosted_forwarding_request(&tenant, payment_hash, now),
+                    now,
+                )
+                .unwrap()
+        })
+        .collect();
+    (store, deliveries, tenant.tenant_id, made, now)
+}
+
+fn pending_keys(
+    deliveries: &[crate::lsp::LspPaymentDelivery],
+) -> std::collections::HashSet<crate::lsp::LspPaymentDeliveryKey> {
+    deliveries.iter().map(|delivery| delivery.key()).collect()
+}
+
+/// The first delivery settled, the second failed: only the third is pending.
+fn settle_two(
+    deliveries: &LspPaymentDeliveryManager<Store>,
+    made: &[crate::lsp::LspPaymentDelivery],
+    now: u64,
+) {
+    deliveries
+        .transition(
+            &made[0].key(),
+            LspPaymentDeliveryStatus::SettlingUpstream {
+                payment_status: PaymentStatus::Success,
+                failure: None,
+            },
+            now + 1,
+        )
+        .unwrap();
+    deliveries
+        .transition(&made[0].key(), LspPaymentDeliveryStatus::Succeeded, now + 2)
+        .unwrap();
+    deliveries
+        .transition(
+            &made[1].key(),
+            LspPaymentDeliveryStatus::Failed {
+                reason: "buffer expired".to_string(),
+            },
+            now + 1,
+        )
+        .unwrap();
+}
+
+#[test]
+fn pending_deliveries_are_read_from_their_own_index() {
+    let root = tempdir().expect("temporary directory");
+    let (store, deliveries, tenant_id, made, now) = three_deliveries(root.path());
+    assert_eq!(
+        pending_keys(&deliveries.list_pending().unwrap()),
+        pending_keys(&made)
+    );
+
+    settle_two(&deliveries, &made, now);
+    assert_eq!(
+        pending_keys(&deliveries.list_pending().unwrap()),
+        pending_keys(&made[2..])
+    );
+    assert!(deliveries.has_pending_for_tenant(&tenant_id).unwrap());
+    // Only the pending one has an entry: a read does not go through the final ones.
+    assert_eq!(
+        store.collect_by_prefix(b"\xf2lsp/delivery-pending/").len(),
+        1
+    );
+    assert_eq!(store.collect_by_prefix(b"\xf2lsp/delivery/").len(), 3);
+}
+
+#[test]
+fn pending_index_is_rebuilt_for_a_store_written_without_it() {
+    let root = tempdir().expect("temporary directory");
+    let (store, deliveries, _, made, now) = three_deliveries(root.path());
+    settle_two(&deliveries, &made, now);
+    // As a binary before the index left the store: deliveries, no index.
+    for pair in store.collect_by_prefix(b"\xf2lsp/delivery-pending/") {
+        store.delete(pair.key);
+    }
+    assert!(deliveries.list_pending().unwrap().is_empty());
+
+    assert_eq!(deliveries.index_pending().unwrap(), 1);
+    assert_eq!(
+        pending_keys(&deliveries.list_pending().unwrap()),
+        pending_keys(&made[2..])
+    );
+    // Again on the next start: the same, nothing added.
+    assert_eq!(deliveries.index_pending().unwrap(), 1);
+    assert_eq!(
+        store.collect_by_prefix(b"\xf2lsp/delivery-pending/").len(),
+        1
     );
 }
 
