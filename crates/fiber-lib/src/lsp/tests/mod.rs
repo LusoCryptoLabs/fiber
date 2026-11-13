@@ -898,11 +898,6 @@ fn hosted_forwarding_request(
     now: u64,
 ) -> TrampolineForwardingRequest {
     let downstream_expiry = 60_000;
-    let incoming_tlc_id = u64::from_be_bytes(
-        payment_hash.as_ref()[..8]
-            .try_into()
-            .expect("payment hash prefix"),
-    );
     TrampolineForwardingRequest {
         payment_hash,
         next_node_id: tenant.tenant_pubkey,
@@ -914,14 +909,25 @@ fn hosted_forwarding_request(
         max_parts: None,
         udt_type_script: None,
         remaining_trampoline_onion: vec![1, 2, 3],
-        previous_tlc: PrevTlcInfo::new_with_shared_secret(
-            Hash256::from([5; 32]),
-            incoming_tlc_id,
-            10,
-            [6; 32],
-        ),
+        previous_tlc: hosted_forwarding_request_previous_tlc(payment_hash),
         max_outgoing_tlc_expiry: now + downstream_expiry + LSP_DELIVERY_SAFETY_MARGIN_MS + 120_000,
     }
+}
+
+/// The incoming TLC `hosted_forwarding_request` gives a payment hash, as a payment outcome
+/// names it.
+fn test_upstream_tlcs(payment_hash: Hash256) -> Vec<(Hash256, u64)> {
+    let previous = hosted_forwarding_request_previous_tlc(payment_hash);
+    vec![(previous.prev_channel_id, previous.prev_tlc_id)]
+}
+
+fn hosted_forwarding_request_previous_tlc(payment_hash: Hash256) -> PrevTlcInfo {
+    let incoming_tlc_id = u64::from_be_bytes(
+        payment_hash.as_ref()[..8]
+            .try_into()
+            .expect("payment hash prefix"),
+    );
+    PrevTlcInfo::new_with_shared_secret(Hash256::from([5; 32]), incoming_tlc_id, 10, [6; 32])
 }
 
 #[test]
@@ -1468,8 +1474,12 @@ impl Actor for MockPublicNetworkActor {
             return Ok(());
         };
         match command {
-            FiberActorCommand::GetPayment(_, reply) => {
+            FiberActorCommand::GetPayment(_, reply)
+            | FiberActorCommand::GetHostedDeliveryPayment { reply, .. } => {
                 let _ = reply.send(Err("payment not started".to_string()));
+            }
+            FiberActorCommand::InspectHostedForward { reply, .. } => {
+                let _ = reply.send(crate::fiber::delivery::HostedForwardStatus::NotForwarded);
             }
             FiberActorCommand::InspectBufferedTrampolineUpstream { reply, .. } => {
                 let status = if state.upstream_pending.load(Ordering::Relaxed) {
@@ -1503,7 +1513,7 @@ impl Actor for MockPublicNetworkActor {
                         reason: "temporary dispatch failure".to_string(),
                     }))
                 } else {
-                    reply.send(Ok(()))
+                    reply.send(Ok(crate::fiber::delivery::HostedDispatch::Payment))
                 };
             }
             FiberActorCommand::ReconcileBufferedTrampolineSettlement { reply, .. } => {
@@ -3246,6 +3256,7 @@ async fn transient_payment_outcome_retries_delivery_before_deadline() {
         ractor::call!(service, |reply| LspServiceMessage::PaymentOutcomeReady(
             PaymentOutcomeRequest {
                 payment_hash,
+                upstream_tlcs: test_upstream_tlcs(payment_hash),
                 payment_status: PaymentStatus::Failed,
                 failure: Some("peer is offline".to_string()),
                 failure_code: Some(TlcErrorCode::TemporaryNodeFailure),
@@ -3342,6 +3353,7 @@ async fn permanent_payment_outcomes_settle_upstream_without_redispatch() {
             ractor::call!(service, |reply| LspServiceMessage::PaymentOutcomeReady(
                 PaymentOutcomeRequest {
                     payment_hash,
+                    upstream_tlcs: test_upstream_tlcs(payment_hash),
                     payment_status: PaymentStatus::Failed,
                     failure: Some(reason.to_string()),
                     failure_code: Some(error_code),
@@ -3357,6 +3369,7 @@ async fn permanent_payment_outcomes_settle_upstream_without_redispatch() {
             ractor::call!(service, |reply| LspServiceMessage::PaymentOutcomeReady(
                 PaymentOutcomeRequest {
                     payment_hash,
+                    upstream_tlcs: test_upstream_tlcs(payment_hash),
                     payment_status: PaymentStatus::Failed,
                     failure: Some(format!("reworded: {reason}")),
                     failure_code: Some(TlcErrorCode::TemporaryNodeFailure),
@@ -3383,6 +3396,7 @@ async fn permanent_payment_outcomes_settle_upstream_without_redispatch() {
             .send_message(LspServiceMessage::PaymentOutcomeSettled(
                 SettledPaymentOutcome {
                     payment_hash,
+                    upstream_tlcs: test_upstream_tlcs(payment_hash),
                     payment_status: PaymentStatus::Failed,
                     failure: Some(reason.to_string()),
                 },
@@ -3477,6 +3491,7 @@ async fn downstream_outcome_is_persisted_before_upstream_settlement() {
             ractor::call!(service, |reply| LspServiceMessage::PaymentOutcomeReady(
                 PaymentOutcomeRequest {
                     payment_hash,
+                    upstream_tlcs: test_upstream_tlcs(payment_hash),
                     payment_status: PaymentStatus::Success,
                     failure: None,
                     failure_code: None,
@@ -3506,6 +3521,7 @@ async fn downstream_outcome_is_persisted_before_upstream_settlement() {
         .send_message(LspServiceMessage::PaymentOutcomeSettled(
             SettledPaymentOutcome {
                 payment_hash,
+                upstream_tlcs: test_upstream_tlcs(payment_hash),
                 payment_status: PaymentStatus::Success,
                 failure: None,
             },
@@ -3540,7 +3556,11 @@ impl Actor for ReconciliationNetworkActor {
             return Ok(());
         };
         match command {
-            FiberActorCommand::GetPayment(payment_hash, reply) => {
+            FiberActorCommand::GetPayment(payment_hash, reply)
+            | FiberActorCommand::GetHostedDeliveryPayment {
+                request: TrampolineForwardingRequest { payment_hash, .. },
+                reply,
+            } => {
                 let _ = reply.send(Ok(crate::fiber::network::SendPaymentResponse {
                     payment_hash,
                     payment_preimage: None,

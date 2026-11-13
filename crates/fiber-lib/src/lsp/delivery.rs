@@ -73,6 +73,12 @@ pub enum LspPaymentDeliveryStatus {
         payment_status: PaymentStatus,
         failure: Option<String>,
     },
+    /// Another payment of Public T holds the hash, so the upstream TLC went to the tenant as a
+    /// plain forward, with no downstream payment session. The channels settle it with the
+    /// tenant's answer; the service only watches the upstream TLC for that answer.
+    ///
+    /// Appended for the same reason as `SettlingUpstream`.
+    Forwarded,
 }
 
 impl LspPaymentDeliveryStatus {
@@ -105,6 +111,11 @@ impl LspPaymentDeliveryStatus {
     /// A proven downstream success can also supersede a pending failure settlement; a success
     /// settlement must never be downgraded by a stale failure.
     ///
+    /// When another payment of Public T holds the hash, dispatch sends the upstream TLC on as a
+    /// plain forward instead (`Forwarded`, from `Dispatching`, or from `InFlight` when recovery
+    /// finds the forward). It ends `Succeeded` or `Failed` with the tenant's answer, or enters
+    /// `SettlingUpstream(Failed)` when no TLC to the tenant came of it.
+    ///
     /// Re-entering the same state is handled as an idempotent update by the delivery manager and
     /// therefore is not considered a transition here. Final states have no outgoing transitions.
     pub(crate) fn check_next_valid(&self, next: &Self) -> bool {
@@ -119,9 +130,13 @@ impl LspPaymentDeliveryStatus {
                     | Self::InFlight
                     | Self::Failed { .. }
                     | Self::SettlingUpstream { .. }
+                    | Self::Forwarded
             ) | (
                 Self::InFlight,
-                Self::Deferred | Self::SettlingUpstream { .. }
+                Self::Deferred | Self::SettlingUpstream { .. } | Self::Forwarded
+            ) | (
+                Self::Forwarded,
+                Self::Succeeded | Self::Failed { .. } | Self::SettlingUpstream { .. }
             ) | (
                 Self::SettlingUpstream { .. },
                 Self::InFlight | Self::Succeeded | Self::Failed { .. }

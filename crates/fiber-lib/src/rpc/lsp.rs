@@ -212,7 +212,11 @@ impl From<InternalPaymentDelivery> for LspPaymentDelivery {
             InternalPaymentDeliveryStatus::Dispatching => {
                 (LspPaymentDeliveryStatus::Dispatching, None)
             }
-            InternalPaymentDeliveryStatus::InFlight => (LspPaymentDeliveryStatus::InFlight, None),
+            // A plain forward to the tenant is in flight like a payment to it; RPC clients keep
+            // the statuses they know.
+            InternalPaymentDeliveryStatus::InFlight | InternalPaymentDeliveryStatus::Forwarded => {
+                (LspPaymentDeliveryStatus::InFlight, None)
+            }
             InternalPaymentDeliveryStatus::SettlingUpstream { .. } => {
                 (LspPaymentDeliveryStatus::SettlingUpstream, None)
             }

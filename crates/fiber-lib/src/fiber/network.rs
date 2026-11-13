@@ -91,8 +91,8 @@ use crate::fiber::channel::{
 use crate::fiber::config::{DEFAULT_COMMITMENT_DELAY_EPOCHS, MIN_TLC_EXPIRY_DELTA};
 #[cfg(not(target_arch = "wasm32"))]
 use crate::fiber::delivery::{
-    DeliveryDecision, HostedDeliveryPort, PaymentOutcomeDecision, PaymentOutcomeRequest,
-    SettledPaymentOutcome,
+    DeliveryDecision, HostedDeliveryPort, HostedDispatch, HostedForwardStatus,
+    PaymentOutcomeDecision, PaymentOutcomeRequest, SettledPaymentOutcome,
 };
 use crate::fiber::delivery::{DeliveryDispatchError, TrampolineForwardingRequest};
 use crate::fiber::fee::{check_open_channel_parameters, check_tlc_delta_with_epochs};
@@ -230,6 +230,70 @@ fn trampoline_upstream_tlc_needs_settlement(
 ) -> bool {
     buffered_trampoline_upstream_status(state, payment_hash, previous_tlc)
         == BufferedTrampolineUpstreamStatus::Pending
+}
+
+/// The incoming (channel, TLC) pairs a trampoline payment session forwards; none for a payment
+/// this node started itself.
+#[cfg(not(target_arch = "wasm32"))]
+fn session_upstream_tlcs(session: &PaymentSession) -> Vec<(Hash256, u64)> {
+    session
+        .request
+        .trampoline_context
+        .as_ref()
+        .map(|context| {
+            context
+                .previous_tlcs
+                .iter()
+                .map(|previous| (previous.prev_channel_id, previous.prev_tlc_id))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// Whether the payment session forwards this incoming TLC. Sessions are keyed by payment hash,
+/// and another payment of this node can hold the hash of a hosted delivery.
+#[cfg(not(target_arch = "wasm32"))]
+fn session_forwards(session: &PaymentSession, previous_tlc: &PrevTlcInfo) -> bool {
+    session_upstream_tlcs(session)
+        .contains(&(previous_tlc.prev_channel_id, previous_tlc.prev_tlc_id))
+}
+
+/// `forwarded`: a TLC to the tenant forwards this incoming TLC, or one is queued to.
+#[cfg(not(target_arch = "wasm32"))]
+fn hosted_forward_status(
+    state: &ChannelActorState,
+    payment_hash: Hash256,
+    previous_tlc: &PrevTlcInfo,
+    forwarded: bool,
+) -> HostedForwardStatus {
+    let tlc_id = TLCId::Received(previous_tlc.prev_tlc_id);
+    let by_reason = |reason: &RemoveTlcReason| match reason {
+        RemoveTlcReason::RemoveTlcFulfill(_) => HostedForwardStatus::Fulfilled,
+        RemoveTlcReason::RemoveTlcFail(_) => HostedForwardStatus::Failed,
+    };
+    let Some(tlc) = state.tlc_state.get(&tlc_id) else {
+        return HostedForwardStatus::Gone;
+    };
+    if tlc.payment_hash != payment_hash {
+        return HostedForwardStatus::Unknown;
+    }
+    if let Some(reason) = &tlc.removed_reason {
+        return by_reason(reason);
+    }
+    state
+        .retryable_tlc_operations
+        .iter()
+        .find_map(|operation| match operation {
+            RetryableTlcOperation::RemoveTlc(id, reason) if *id == tlc_id => {
+                Some(by_reason(reason))
+            }
+            _ => None,
+        })
+        .unwrap_or(if forwarded || tlc.forwarding_tlc.is_some() {
+            HostedForwardStatus::Pending
+        } else {
+            HostedForwardStatus::NotForwarded
+        })
 }
 
 // (128 + 2) KB, 2 KB for custom records
@@ -1263,7 +1327,20 @@ pub enum FiberActorCommand {
     #[cfg(not(target_arch = "wasm32"))]
     DispatchBufferedTrampoline {
         request: TrampolineForwardingRequest,
-        reply: RpcReplyPort<Result<(), DeliveryDispatchError>>,
+        reply: RpcReplyPort<Result<HostedDispatch, DeliveryDispatchError>>,
+    },
+    /// The payment session paying a hosted delivery, only when it forwards that delivery's
+    /// incoming TLC: another payment of this node can hold the same hash.
+    #[cfg(not(target_arch = "wasm32"))]
+    GetHostedDeliveryPayment {
+        request: TrampolineForwardingRequest,
+        reply: RpcReplyPort<Result<SendPaymentResponse, String>>,
+    },
+    /// How far a hosted delivery sent as a plain forward ([`HostedDispatch::Forward`]) got.
+    #[cfg(not(target_arch = "wasm32"))]
+    InspectHostedForward {
+        request: TrampolineForwardingRequest,
+        reply: RpcReplyPort<HostedForwardStatus>,
     },
     #[cfg(not(target_arch = "wasm32"))]
     ReconcileBufferedTrampolineSettlement {
@@ -3640,15 +3717,24 @@ where
             }
             #[cfg(not(target_arch = "wasm32"))]
             FiberActorCommand::DispatchBufferedTrampoline { request, reply } => {
+                if self.hash_held_by_another_payment(&request) {
+                    // Boxed outside this handler: in a debug build its frame holds every arm's
+                    // locals.
+                    let result = self.forward_hosted_delivery_boxed(state, request).await;
+                    let _ = reply.send(result.map(|()| HostedDispatch::Forward));
+                    return Ok(());
+                }
                 match self.try_dispatch_trampoline_payment(state, request).await {
                     Ok(receiver) => {
                         crate::tasks::spawn(async move {
                             let result = match receiver.await {
-                                Ok(result) => result.map(|_| ()).map_err(|error| {
-                                    DeliveryDispatchError::Temporary {
-                                        reason: error.message,
-                                    }
-                                }),
+                                Ok(result) => {
+                                    result.map(|_| HostedDispatch::Payment).map_err(|error| {
+                                        DeliveryDispatchError::Temporary {
+                                            reason: error.message,
+                                        }
+                                    })
+                                }
                                 Err(error) => Err(DeliveryDispatchError::Temporary {
                                     reason: format!(
                                         "payment actor dropped its startup reply: {error}"
@@ -3662,6 +3748,14 @@ where
                         let _ = reply.send(Err(error));
                     }
                 }
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            FiberActorCommand::GetHostedDeliveryPayment { request, reply } => {
+                let _ = reply.send(self.hosted_delivery_payment(&request));
+            }
+            #[cfg(not(target_arch = "wasm32"))]
+            FiberActorCommand::InspectHostedForward { request, reply } => {
+                let _ = reply.send(self.inspect_hosted_forward(&request));
             }
             #[cfg(not(target_arch = "wasm32"))]
             FiberActorCommand::ReconcileBufferedTrampolineSettlement {
@@ -5374,6 +5468,237 @@ where
         Ok(receiver)
     }
 
+    /// The payment session paying a hosted delivery, only when it forwards that delivery's
+    /// incoming TLC. Kept out of `handle_command`, as are the helpers below: a debug build gives
+    /// every arm's locals a slot in that one frame.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline(never)]
+    fn hosted_delivery_payment(
+        &self,
+        request: &TrampolineForwardingRequest,
+    ) -> Result<SendPaymentResponse, String> {
+        match self.store.get_payment_session(request.payment_hash) {
+            Some(session) if session_forwards(&session, &request.previous_tlc) => self
+                .on_get_payment(&request.payment_hash)
+                .map_err(|error| error.to_string()),
+            Some(_) => Err(format!(
+                "the payment for {} forwards another incoming TLC",
+                request.payment_hash
+            )),
+            None => Err(format!(
+                "Payment session not found: {:?}",
+                request.payment_hash
+            )),
+        }
+    }
+
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline(never)]
+    fn inspect_hosted_forward(&self, request: &TrampolineForwardingRequest) -> HostedForwardStatus {
+        let forwarded = self.tenant_has_forward_of(
+            &request.next_node_id,
+            &request.previous_tlc,
+            request.payment_hash,
+        );
+        self.store
+            .get_channel_actor_state(&request.previous_tlc.prev_channel_id)
+            .map(|channel| {
+                hosted_forward_status(
+                    &channel,
+                    request.payment_hash,
+                    &request.previous_tlc,
+                    forwarded,
+                )
+            })
+            .unwrap_or(HostedForwardStatus::Unknown)
+    }
+
+    /// Whether another payment of this node holds the hash of a hosted delivery: a payment
+    /// session for it exists that goes to another node and does not forward this delivery's
+    /// incoming TLC. Sessions and payment actors are keyed by the hash, so the delivery cannot
+    /// get a session of its own. A P2P desk does this: a tenant pays the desk's hold invoice
+    /// through this node, then the desk pays another tenant's invoice with the same hash.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline(never)]
+    fn hash_held_by_another_payment(&self, request: &TrampolineForwardingRequest) -> bool {
+        self.store
+            .get_payment_session(request.payment_hash)
+            .is_some_and(|session| {
+                session.request.target_pubkey != request.next_node_id
+                    && !session_forwards(&session, &request.previous_tlc)
+            })
+    }
+
+    /// Whether a TLC already forwards this incoming TLC into one of the tenant's channels, or
+    /// one is queued to: a dispatch whose answer was lost, or one repeated after a restart, must
+    /// not pay the tenant twice.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline(never)]
+    fn tenant_has_forward_of(
+        &self,
+        tenant: &Pubkey,
+        previous_tlc: &PrevTlcInfo,
+        payment_hash: Hash256,
+    ) -> bool {
+        let upstream = (previous_tlc.prev_channel_id, previous_tlc.prev_tlc_id);
+        self.store
+            .get_channel_ids_by_pubkey(tenant)
+            .into_iter()
+            .filter_map(|channel_id| self.store.get_channel_actor_state(&channel_id))
+            .any(|channel| {
+                let offered = channel.tlc_state.offered_tlcs.tlcs.iter().any(|tlc| {
+                    tlc.payment_hash == payment_hash && tlc.forwarding_tlc == Some(upstream)
+                });
+                let queued = channel.retryable_tlc_operations.iter().any(|operation| {
+                    matches!(
+                        operation,
+                        RetryableTlcOperation::AddTlc(command)
+                            if command.payment_hash == payment_hash
+                                && command.previous_tlc.is_some_and(|previous| {
+                                    (previous.prev_channel_id, previous.prev_tlc_id) == upstream
+                                })
+                    )
+                });
+                offered || queued
+            })
+    }
+
+    /// Whether the incoming TLC still waits for this delivery: pending, not forwarded, and
+    /// waiting for a forward result.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline(never)]
+    fn hosted_upstream_waits(&self, previous_tlc: &PrevTlcInfo, payment_hash: Hash256) -> bool {
+        let Some(upstream) = self
+            .store
+            .get_channel_actor_state(&previous_tlc.prev_channel_id)
+        else {
+            return false;
+        };
+        let upstream_tlc_id = TLCId::Received(previous_tlc.prev_tlc_id);
+        upstream
+            .tlc_state
+            .get(&upstream_tlc_id)
+            .is_some_and(|tlc| tlc.forwarding_tlc.is_none())
+            && upstream
+                .waiting_forward_tlc_tasks
+                .contains_key(&upstream_tlc_id)
+            && trampoline_upstream_tlc_needs_settlement(&upstream, payment_hash, previous_tlc)
+    }
+
+    /// `forward_hosted_delivery`, boxed here so its future never sits in `handle_command`'s
+    /// frame.
+    #[cfg(not(target_arch = "wasm32"))]
+    #[inline(never)]
+    fn forward_hosted_delivery_boxed<'a>(
+        &'a self,
+        state: &'a mut FiberActorState<S, C>,
+        request: TrampolineForwardingRequest,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<(), DeliveryDispatchError>> + Send + 'a>,
+    > {
+        Box::pin(self.forward_hosted_delivery(state, request))
+    }
+
+    /// Send a hosted delivery on to its tenant as a plain forward: the onion the payment session
+    /// would build for the tenant's channel, offered there with the incoming TLC as the previous
+    /// one. The channels then settle the incoming TLC with the tenant's answer, as for any
+    /// forward.
+    #[cfg(not(target_arch = "wasm32"))]
+    async fn forward_hosted_delivery(
+        &self,
+        state: &mut FiberActorState<S, C>,
+        request: TrampolineForwardingRequest,
+    ) -> Result<(), DeliveryDispatchError> {
+        let payment_hash = request.payment_hash;
+        let tenant = request.next_node_id;
+        let mut previous_tlc = request.previous_tlc;
+        // The outer onion ended here, so the incoming TLC recorded no forwarding fee: this node's
+        // fee is the trampoline budget (incoming amount less the amount to forward, checked in
+        // `forward_trampoline_packet`). The tenant's channel checks it against its fee rate, as
+        // the payment session does (`apply_trampoline_forwarding_fee`).
+        previous_tlc.forwarding_fee = request.build_max_fee_amount;
+        let temporary = |reason: String| DeliveryDispatchError::Temporary { reason };
+
+        if self.tenant_has_forward_of(&tenant, &previous_tlc, payment_hash) {
+            debug!(%payment_hash, "Hosted delivery already forwarded to its tenant");
+            return Ok(());
+        }
+        if !self.hosted_upstream_waits(&previous_tlc, payment_hash) {
+            return Err(DeliveryDispatchError::Permanent {
+                reason: "the incoming TLC no longer waits for this delivery".to_string(),
+                error_code: TlcErrorCode::TemporaryNodeFailure,
+            });
+        }
+
+        let payment_data = request.clone().into_send_payment_data().map_err(|reason| {
+            DeliveryDispatchError::Permanent {
+                reason: format!("invalid hosted payment request: {reason}"),
+                error_code: TlcErrorCode::InvalidOnionPayload,
+            }
+        })?;
+        let graph = self.network_graph.clone();
+        let amount = request.amount_to_forward;
+        let max_fee_amount = Some(request.build_max_fee_amount);
+        let mut hops = tokio::task::spawn_blocking(move || {
+            graph.blocking_read().build_route(
+                amount,
+                None,
+                max_fee_amount,
+                &super::graph::SendPaymentState::new(payment_data),
+            )
+        })
+        .await
+        .map_err(|error| temporary(format!("route task failed: {error}")))?
+        .map_err(|error| temporary(format!("no route to the tenant yet: {error}")))?;
+        // One hop: this node's channel with the tenant, then the tenant itself.
+        if hops.len() != 2 || hops[0].next_hop != Some(tenant) {
+            return Err(temporary(format!(
+                "the route to the tenant is not its own channel ({} hops)",
+                hops.len()
+            )));
+        }
+        if hops[0].expiry > request.max_outgoing_tlc_expiry {
+            return Err(DeliveryDispatchError::Permanent {
+                reason: "the tenant's TLC would outlast the incoming one".to_string(),
+                error_code: TlcErrorCode::IncorrectTlcExpiry,
+            });
+        }
+        if let Some(last_hop) = hops.last_mut() {
+            last_hop.set_trampoline_onion(request.remaining_trampoline_onion);
+        }
+        let (peeled_onion_packet, _session_key) =
+            PeeledPaymentOnionPacket::create_with_session_key_fn(
+                || Privkey::from_slice(crate::fiber::KeyPair::generate_random_key().as_ref()),
+                hops,
+                Some(payment_hash.as_ref().to_vec()),
+                SECP256K1,
+            )
+            .map_err(|error| temporary(format!("failed to build the tenant's onion: {error:?}")))?;
+
+        self.handle_send_onion_packet_command(
+            state,
+            SendOnionPacketCommand {
+                peeled_onion_packet,
+                previous_tlc: Some(previous_tlc),
+                payment_hash,
+                attempt_id: None,
+            },
+        )
+        .await
+        .map_err(|error| {
+            temporary(format!(
+                "failed to offer the tenant's TLC: {}",
+                error.error_code_as_str()
+            ))
+        })?;
+        info!(
+            %payment_hash,
+            ?tenant,
+            "Hosted delivery forwarded to its tenant: another payment holds its hash"
+        );
+        Ok(())
+    }
+
     #[cfg(not(target_arch = "wasm32"))]
     async fn accept_or_dispatch_hosted_trampoline(
         &self,
@@ -5408,7 +5733,34 @@ where
         reason: String,
         error_code: TlcErrorCode,
     ) -> Result<bool, String> {
+        // Sent on as a plain forward: the tenant's answer settles the upstream TLC, and failing
+        // it now could leave the tenant paid with nothing claimed upstream.
+        if self.tenant_has_forward_of(
+            &request.next_node_id,
+            &request.previous_tlc,
+            request.payment_hash,
+        ) {
+            return Ok(false);
+        }
         if let Some(session) = state.store.get_payment_session(request.payment_hash) {
+            if !session_forwards(&session, &request.previous_tlc) {
+                // Another payment of this node holds the hash: its session is not this
+                // delivery's to settle, and a failed session written here would replace it.
+                // Fail this delivery's incoming TLC alone, as a forward that could not go on.
+                let error = TlcErr::new_node_fail(error_code, state.get_public_key());
+                let _ = state.network.send_message(FiberActorMessage::Event(
+                    FiberActorEvent::AddTlcResult(
+                        request.payment_hash,
+                        None,
+                        Err((
+                            ProcessingChannelError::TlcForwardingError(error.clone()),
+                            error,
+                        )),
+                        Some(request.previous_tlc),
+                    ),
+                ));
+                return Ok(true);
+            }
             if session.status != PaymentStatus::Failed {
                 return Ok(false);
             }
@@ -5434,6 +5786,7 @@ where
             if let Some(port) = delivery_port {
                 port.report_settled_payment(SettledPaymentOutcome {
                     payment_hash,
+                    upstream_tlcs: session_upstream_tlcs(&session),
                     payment_status: PaymentStatus::Failed,
                     failure: session.last_error.clone(),
                 });
@@ -8846,6 +9199,7 @@ where
                 // calls can be served.
                 let request = PaymentOutcomeRequest {
                     payment_hash,
+                    upstream_tlcs: session_upstream_tlcs(&session),
                     payment_status: session.status,
                     failure: session.last_error.clone(),
                     failure_code: session.last_error_code,
@@ -8894,6 +9248,7 @@ where
             if let Some(port) = self.delivery_port.as_ref() {
                 port.report_settled_payment(SettledPaymentOutcome {
                     payment_hash,
+                    upstream_tlcs: session_upstream_tlcs(session),
                     payment_status: session.status,
                     failure: session.last_error.clone(),
                 });

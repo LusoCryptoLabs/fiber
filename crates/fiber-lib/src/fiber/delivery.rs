@@ -55,6 +55,38 @@ pub enum DeliveryDecision {
 }
 
 #[cfg(not(target_arch = "wasm32"))]
+/// How the core sent a buffered hosted payment on to its tenant.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum HostedDispatch {
+    /// A payment session for the hash pays the tenant; its outcome comes back through
+    /// [`HostedDeliveryPort::decide_payment_outcome`].
+    Payment,
+    /// Another payment of this node already holds the hash, so the upstream TLC went to the
+    /// tenant as a plain forward; the channels settle it, with no payment session.
+    Forward,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
+/// The incoming TLC of a hosted delivery sent as a plain forward, as its channel has it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HostedForwardStatus {
+    /// Still pending, and no TLC forwards it to the tenant, nor is one queued to.
+    NotForwarded,
+    /// Still pending, forwarded to the tenant: the tenant has not answered, or its answer is on
+    /// its way back.
+    Pending,
+    /// Removed, or about to be, with the tenant's preimage.
+    Fulfilled,
+    /// Removed, or about to be, as failed.
+    Failed,
+    /// No longer in the channel: its removal was applied. A fulfilled TLC leaves at once, a
+    /// failed one when both sides have confirmed it, so this alone does not tell which.
+    Gone,
+    /// The channel is unavailable or the TLC carries another payment hash.
+    Unknown,
+}
+
+#[cfg(not(target_arch = "wasm32"))]
 /// Action the core should take after the delivery service persisted an outcome.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum PaymentOutcomeDecision {
@@ -69,6 +101,10 @@ pub enum PaymentOutcomeDecision {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct PaymentOutcomeRequest {
     pub payment_hash: Hash256,
+    /// The incoming (channel, TLC) pairs the payment forwards. A delivery owns the outcome only
+    /// when its own incoming TLC is among them: the hash alone also matches any other payment
+    /// of this node with the same hash.
+    pub upstream_tlcs: Vec<(Hash256, u64)>,
     pub payment_status: crate::fiber_types::PaymentStatus,
     pub failure: Option<String>,
     pub failure_code: Option<TlcErrorCode>,
@@ -79,6 +115,8 @@ pub struct PaymentOutcomeRequest {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct SettledPaymentOutcome {
     pub payment_hash: Hash256,
+    /// See [`PaymentOutcomeRequest::upstream_tlcs`].
+    pub upstream_tlcs: Vec<(Hash256, u64)>,
     pub payment_status: crate::fiber_types::PaymentStatus,
     pub failure: Option<String>,
 }

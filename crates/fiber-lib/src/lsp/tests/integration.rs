@@ -34,15 +34,18 @@ use crate::watchtower::WatchtowerStore;
 use crate::{
     ckb::{client::CkbRpcClient, config::CkbConfig},
     fiber::{
+        graph::NetworkGraphStateStore,
         network::{
             AcceptChannelCommand, FiberActorCommand, FiberActorMessage, FiberActorRef,
             NetworkActorMessage, PublicNetworkCommand,
         },
         payment::SendPaymentCommand,
     },
-    fiber_types::{HashAlgorithm, PaymentStatus, Privkey, RemoveTlcReason, TLCId, TlcErrorCode},
+    fiber_types::{
+        Hash256, HashAlgorithm, PaymentStatus, Privkey, RemoveTlcReason, TLCId, TlcErrorCode,
+    },
     gen_rand_sha256_hash,
-    invoice::{CkbInvoiceStatus, Currency, InvoiceBuilder},
+    invoice::{CkbInvoice, CkbInvoiceStatus, Currency, InvoiceBuilder},
     lsp::{
         tenant_watchtower_node_id, BiscuitTokenIssuer, FiberTenantRuntimeFactory,
         HostedTenantRecord, HostedTenantRpcContext, HostedTenantRuntime, LspInvoiceStore,
@@ -2758,6 +2761,448 @@ async fn hosted_tenant_pays_hosted_tenant_across_two_lsps() {
     assert!(route_pubkeys.contains(&network.nodes[1].pubkey));
     assert!(route_pubkeys.contains(&network.nodes[2].pubkey));
     assert!(route_pubkeys.contains(&network.nodes[3].pubkey));
+
+    network.stop().await;
+}
+
+/// A hosted tenant's invoice for the hash of `preimage`: settled with it at once, or held until
+/// the test settles it.
+async fn new_desk_trade_invoice(
+    tenant: &HostedTenantTestNode,
+    amount: u128,
+    preimage: Hash256,
+    hold: bool,
+) -> CkbInvoice {
+    let payment_hash: Hash256 = HashAlgorithm::CkbHash.hash(preimage.as_ref()).into();
+    let invoice: fiber_json_types::InvoiceResult = tenant
+        .client
+        .request(
+            "new_invoice",
+            rpc_params![fiber_json_types::NewInvoiceParams {
+                amount,
+                description: Some("a buyer's invoice on a P2P desk".to_string()),
+                currency: fiber_json_types::Currency::Fibd,
+                payment_preimage: (!hold).then(|| preimage.into()),
+                payment_hash: hold.then(|| payment_hash.into()),
+                expiry: Some(60 * 60),
+                fallback_address: None,
+                final_expiry_delta: None,
+                udt_type_script: None,
+                hash_algorithm: None,
+                allow_mpp: Some(false),
+                allow_trampoline_routing: Some(true),
+            }],
+        )
+        .await
+        .expect("create the buyer's hosted invoice");
+    let invoice =
+        CkbInvoice::from_str(&invoice.invoice_address).expect("decode the buyer's invoice");
+    assert_eq!(*invoice.payment_hash(), payment_hash);
+    invoice
+}
+
+/// The desk's hold invoice for a buyer's hash: no preimage, it settles once the buyer is paid.
+fn new_desk_hold_invoice(desk: &NetworkNode, amount: u128, payment_hash: Hash256) -> CkbInvoice {
+    let invoice = InvoiceBuilder::new(Currency::Fibd)
+        .amount(Some(amount))
+        .payment_hash(payment_hash)
+        .allow_trampoline_routing(true)
+        .payee_pub_key(desk.pubkey.into())
+        .description("the desk's hold invoice for the buyer's hash".to_string())
+        .payment_secret(gen_rand_sha256_hash())
+        .build_with_sign(|message| SECP256K1.sign_ecdsa_recoverable(message, &desk.private_key.0))
+        .expect("build the desk's hold invoice");
+    desk.insert_invoice(invoice.clone(), None);
+    invoice
+}
+
+async fn payment_end(node: &NetworkNode, payment_hash: Hash256) -> PaymentStatus {
+    let mut status = PaymentStatus::Created;
+    for _ in 0..120 {
+        status = node.get_payment_status(payment_hash).await;
+        if matches!(status, PaymentStatus::Success | PaymentStatus::Failed) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(500)).await;
+    }
+    status
+}
+
+fn hosted_deliveries(
+    public_t: &NetworkNode,
+    payment_hash: Hash256,
+) -> Vec<crate::lsp::LspPaymentDelivery> {
+    public_t
+        .store
+        .namespaced(NodeNamespace::lsp_metadata())
+        .list_lsp_payment_deliveries_by_payment_hash(&payment_hash)
+        .expect("read hosted deliveries")
+}
+
+fn delivery_states(
+    public_t: &NetworkNode,
+    payment_hash: Hash256,
+) -> Vec<(crate::lsp::LspPaymentDeliveryStatus, Option<String>)> {
+    hosted_deliveries(public_t, payment_hash)
+        .into_iter()
+        .map(|delivery| (delivery.status, delivery.last_error))
+        .collect()
+}
+
+/// TLCs Public T offered the tenant for this hash, on its side of their channel.
+fn offered_to_tenant(
+    public_t: &NetworkNode,
+    tenant: &HostedTenantTestNode,
+    payment_hash: Hash256,
+) -> usize {
+    public_t
+        .get_channel_actor_state(tenant.private_channel_id)
+        .tlc_state
+        .offered_tlcs
+        .tlcs
+        .iter()
+        .filter(|tlc| tlc.payment_hash == payment_hash)
+        .count()
+}
+
+/// A P2P desk and two tenants of Public T trading through it:
+///
+/// Hosted seller S -private- Public T -private- Hosted buyer B
+///                              |
+///                           public
+///                              |
+///                           Desk R
+///
+/// One hash runs end to end: B makes an invoice for H, R makes a hold invoice for the same H,
+/// S pays it through T and R holds it; once the trade clears, R pays B's invoice through T and
+/// settles its hold with the preimage B reveals.
+async fn create_desk_trade_network() -> LspTestNetwork {
+    let network = create_lsp_test_network(
+        &[((0, 1), (HUGE_CKB_AMOUNT, HUGE_CKB_AMOUNT), true)],
+        2,
+        &[
+            ((0, "seller"), (HUGE_CKB_AMOUNT, HUGE_CKB_AMOUNT)),
+            ((0, "buyer"), (HUGE_CKB_AMOUNT, HUGE_CKB_AMOUNT)),
+        ],
+    )
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    network
+}
+
+/// S pays R's hold invoice through T, and R holds it: T now has a payment session for H, S's.
+async fn seller_pays_the_desk_hold(network: &LspTestNetwork, hold: &CkbInvoice) {
+    let public_t = &network.nodes[0];
+    let desk = &network.nodes[1];
+    let payment_hash = *hold.payment_hash();
+    network
+        .send_payment(
+            0,
+            "seller",
+            SendPaymentCommand {
+                invoice: Some(hold.to_string()),
+                max_fee_amount: Some(2_000_000),
+                trampoline_hops: Some(vec![public_t.pubkey]),
+                ..Default::default()
+            },
+        )
+        .await
+        .expect("the seller pays the desk's hold invoice");
+    wait_until_async_timeout(|| async {
+        desk.get_invoice_status(&payment_hash) == Some(CkbInvoiceStatus::Received)
+    })
+    .await;
+    let session = public_t
+        .store
+        .get_payment_session(payment_hash)
+        .expect("T forwards the seller's payment with a session for H");
+    assert_eq!(session.request.target_pubkey, desk.pubkey);
+}
+
+async fn desk_pays_the_buyer(network: &LspTestNetwork, invoice: &CkbInvoice) {
+    network.nodes[1]
+        .send_payment(SendPaymentCommand {
+            invoice: Some(invoice.to_string()),
+            max_fee_amount: Some(2_000_000),
+            trampoline_hops: Some(vec![network.nodes[0].pubkey]),
+            ..Default::default()
+        })
+        .await
+        .expect("the desk pays the buyer's invoice");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_tenant_is_paid_with_a_hash_its_lsp_already_pays_elsewhere() {
+    init_tracing();
+
+    // T already has a payment session for H (S's, held at R). It refused a second one for B's
+    // delivery ("Already had a payment actor with the same hash") and retried every second until
+    // the hold ended. T now hands B its payment as a plain forward.
+    let network = create_desk_trade_network().await;
+    let public_t = &network.nodes[0];
+    let desk = &network.nodes[1];
+    let buyer = network.tenant(0, "buyer");
+    let amount = 1_000_000;
+    let preimage = gen_rand_sha256_hash();
+    let buyer_invoice = new_desk_trade_invoice(buyer, amount, preimage, false).await;
+    let payment_hash = *buyer_invoice.payment_hash();
+    let hold = new_desk_hold_invoice(desk, amount, payment_hash);
+    seller_pays_the_desk_hold(&network, &hold).await;
+
+    let buyer_before = buyer
+        .node
+        .get_local_balance_from_channel(buyer.private_channel_id);
+    desk_pays_the_buyer(&network, &buyer_invoice).await;
+    let status = payment_end(desk, payment_hash).await;
+    let deliveries = delivery_states(public_t, payment_hash);
+    assert_eq!(
+        status,
+        PaymentStatus::Success,
+        "the desk's payment to the buyer ended {status:?}; T's deliveries: {deliveries:?}"
+    );
+    assert_eq!(
+        buyer.node.get_invoice_status(&payment_hash),
+        Some(CkbInvoiceStatus::Paid)
+    );
+    let learned = desk
+        .get_payment_result(payment_hash)
+        .await
+        .payment_preimage
+        .expect("the desk learns the buyer's preimage");
+    assert_eq!(learned, preimage);
+
+    desk.settle_invoice(&payment_hash, learned)
+        .await
+        .expect("the desk settles its hold invoice");
+    network
+        .tenant(0, "seller")
+        .node
+        .wait_until_success(payment_hash)
+        .await;
+    wait_for_delivery_status(
+        &network.lsp(0).client,
+        payment_hash,
+        LspPaymentDeliveryStatus::Succeeded,
+    )
+    .await;
+    assert_eq!(hosted_deliveries(public_t, payment_hash).len(), 1);
+    wait_until_async_timeout(|| async {
+        buyer
+            .node
+            .get_local_balance_from_channel(buyer.private_channel_id)
+            == buyer_before + amount
+    })
+    .await;
+    assert_eq!(
+        public_t
+            .store
+            .get_payment_session(payment_hash)
+            .map(|session| (session.request.target_pubkey, session.status)),
+        Some((desk.pubkey, PaymentStatus::Success)),
+        "T's session for H is still the seller's, now paid"
+    );
+
+    network.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn another_payment_ending_with_its_hash_leaves_a_forwarded_delivery_alone() {
+    init_tracing();
+
+    // B holds its payment while S's payment, the session T has for H, fails first. Read by hash
+    // alone, S's failure would be taken for B's delivery, and a retried delivery would pay B
+    // twice. B's delivery must wait for B's own answer, and a repeated dispatch must not reach B
+    // again.
+    let network = create_desk_trade_network().await;
+    let public_t = &network.nodes[0];
+    let desk = &network.nodes[1];
+    let seller = network.tenant(0, "seller");
+    let buyer = network.tenant(0, "buyer");
+    let amount = 1_000_000;
+    let preimage = gen_rand_sha256_hash();
+    let buyer_invoice = new_desk_trade_invoice(buyer, amount, preimage, true).await;
+    let payment_hash = *buyer_invoice.payment_hash();
+    let hold = new_desk_hold_invoice(desk, amount, payment_hash);
+    seller_pays_the_desk_hold(&network, &hold).await;
+
+    let buyer_before = buyer
+        .node
+        .get_local_balance_from_channel(buyer.private_channel_id);
+    desk_pays_the_buyer(&network, &buyer_invoice).await;
+    wait_until_async_timeout(|| async {
+        buyer.node.get_invoice_status(&payment_hash) == Some(CkbInvoiceStatus::Received)
+    })
+    .await;
+    assert_eq!(offered_to_tenant(public_t, buyer, payment_hash), 1);
+
+    desk.cancel_invoice(&payment_hash);
+    assert_eq!(
+        payment_end(&seller.node, payment_hash).await,
+        PaymentStatus::Failed
+    );
+    wait_until_async_timeout(|| async {
+        public_t
+            .store
+            .get_payment_session(payment_hash)
+            .is_some_and(|session| session.status == PaymentStatus::Failed)
+    })
+    .await;
+    // Room for the service to act on the seller's outcome.
+    tokio::time::sleep(Duration::from_secs(3)).await;
+    let deliveries = hosted_deliveries(public_t, payment_hash);
+    assert_eq!(deliveries.len(), 1);
+    assert_eq!(
+        deliveries[0].status,
+        crate::lsp::LspPaymentDeliveryStatus::Forwarded,
+        "the seller's failure is not the buyer's delivery's"
+    );
+    assert_eq!(
+        buyer.node.get_invoice_status(&payment_hash),
+        Some(CkbInvoiceStatus::Received)
+    );
+
+    let request = deliveries[0].request.clone();
+    let again = ractor::call!(public_t.network_actor, |reply| {
+        NetworkActorMessage::new_command(FiberActorCommand::DispatchBufferedTrampoline {
+            request,
+            reply,
+        })
+    })
+    .expect("Public T answers");
+    assert_eq!(again, Ok(crate::fiber::delivery::HostedDispatch::Forward));
+    tokio::time::sleep(Duration::from_secs(1)).await;
+    assert_eq!(
+        offered_to_tenant(public_t, buyer, payment_hash),
+        1,
+        "a repeated dispatch must not offer the buyer a second TLC"
+    );
+
+    // A restart between the forward and its record leaves the delivery Dispatching. The service
+    // must find the forward, not take the seller's failed session for the delivery's own.
+    let mut interrupted = deliveries[0].clone();
+    interrupted.status = crate::lsp::LspPaymentDeliveryStatus::Dispatching;
+    public_t
+        .store
+        .namespaced(NodeNamespace::lsp_metadata())
+        .put_lsp_payment_delivery(&interrupted)
+        .expect("rewind the delivery to Dispatching");
+    network
+        .lsp(0)
+        .actor
+        .send_message(LspServiceMessage::ResumeDelivery(interrupted.key()))
+        .expect("the LSP service is running");
+    wait_until_async_timeout(|| async {
+        hosted_deliveries(public_t, payment_hash)
+            .iter()
+            .all(|delivery| delivery.status == crate::lsp::LspPaymentDeliveryStatus::Forwarded)
+    })
+    .await;
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert_eq!(
+        hosted_deliveries(public_t, payment_hash)[0].status,
+        crate::lsp::LspPaymentDeliveryStatus::Forwarded
+    );
+    assert_eq!(offered_to_tenant(public_t, buyer, payment_hash), 1);
+
+    buyer
+        .node
+        .settle_invoice(&payment_hash, preimage)
+        .await
+        .expect("the buyer settles its held invoice");
+    assert_eq!(
+        payment_end(desk, payment_hash).await,
+        PaymentStatus::Success
+    );
+    wait_for_delivery_status(
+        &network.lsp(0).client,
+        payment_hash,
+        LspPaymentDeliveryStatus::Succeeded,
+    )
+    .await;
+    wait_until_async_timeout(|| async {
+        buyer
+            .node
+            .get_local_balance_from_channel(buyer.private_channel_id)
+            == buyer_before + amount
+    })
+    .await;
+
+    network.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn a_failed_delivery_fails_its_own_tlc_and_not_another_payment_with_its_hash() {
+    init_tracing();
+
+    // B stays away until its delivery expires. T handed the failure to the session it has for
+    // H, S's: still in flight, so the delivery went back to waiting and the desk's payment
+    // stayed in flight. T must fail the desk's TLC alone and leave S's session as it is.
+    let network = create_desk_trade_network().await;
+    let public_t = &network.nodes[0];
+    let desk = &network.nodes[1];
+    let buyer = network.tenant(0, "buyer");
+    let amount = 1_000_000;
+    let buyer_invoice = new_desk_trade_invoice(buyer, amount, gen_rand_sha256_hash(), false).await;
+    let payment_hash = *buyer_invoice.payment_hash();
+    let hold = new_desk_hold_invoice(desk, amount, payment_hash);
+    seller_pays_the_desk_hold(&network, &hold).await;
+
+    disconnect_in_process(public_t, &buyer.node);
+    wait_for_tenant_channel(&network.lsp(0).client, &buyer.tenant_id, false).await;
+    desk_pays_the_buyer(&network, &buyer_invoice).await;
+    wait_for_delivery_status(
+        &network.lsp(0).client,
+        payment_hash,
+        LspPaymentDeliveryStatus::Deferred,
+    )
+    .await;
+    // Its buffer deadline passes.
+    let mut expired = hosted_deliveries(public_t, payment_hash).remove(0);
+    expired.buffer_deadline = crate::now_timestamp_as_millis_u64();
+    public_t
+        .store
+        .namespaced(NodeNamespace::lsp_metadata())
+        .put_lsp_payment_delivery(&expired)
+        .expect("move the buffer deadline to now");
+    network
+        .lsp(0)
+        .actor
+        .send_message(LspServiceMessage::ExpireDelivery(expired.key()))
+        .expect("the LSP service is running");
+
+    let status = payment_end(desk, payment_hash).await;
+    let deliveries = delivery_states(public_t, payment_hash);
+    assert_eq!(
+        status,
+        PaymentStatus::Failed,
+        "the desk's payment to an away buyer ended {status:?}; T's deliveries: {deliveries:?}"
+    );
+    wait_for_delivery_status(
+        &network.lsp(0).client,
+        payment_hash,
+        LspPaymentDeliveryStatus::Failed,
+    )
+    .await;
+    assert_eq!(offered_to_tenant(public_t, buyer, payment_hash), 0);
+    assert_eq!(
+        public_t
+            .store
+            .get_payment_session(payment_hash)
+            .map(|session| (session.request.target_pubkey, session.status)),
+        Some((desk.pubkey, PaymentStatus::Inflight)),
+        "T's session for H is still the seller's, in flight"
+    );
+    assert_eq!(
+        desk.get_invoice_status(&payment_hash),
+        Some(CkbInvoiceStatus::Received),
+        "the seller's payment is still held at the desk"
+    );
+
+    desk.cancel_invoice(&payment_hash);
+    assert_eq!(
+        payment_end(&network.tenant(0, "seller").node, payment_hash).await,
+        PaymentStatus::Failed
+    );
 
     network.stop().await;
 }

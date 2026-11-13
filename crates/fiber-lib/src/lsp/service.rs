@@ -9,8 +9,9 @@ use ractor::{Actor, ActorProcessingErr, ActorRef, RpcReplyPort};
 use crate::fiber::{
     channel::{ChannelActorState, ChannelActorStateStore},
     delivery::{
-        DeliveryDecision, DeliveryDispatchError, PaymentOutcomeDecision, PaymentOutcomeRequest,
-        SettledPaymentOutcome, TrampolineForwardingRequest,
+        DeliveryDecision, DeliveryDispatchError, HostedDispatch, HostedForwardStatus,
+        PaymentOutcomeDecision, PaymentOutcomeRequest, SettledPaymentOutcome,
+        TrampolineForwardingRequest,
     },
     network::{BufferedTrampolineUpstreamStatus, FiberActorCommand, NetworkActorMessage},
 };
@@ -18,7 +19,7 @@ use crate::fiber_types::{
     ChannelState, Hash256, PaymentStatus, Privkey, Pubkey, TenantRegistryPayload,
     TenantRegistrySignature, TlcErrorCode,
 };
-use crate::invoice::CkbInvoice;
+use crate::invoice::{CkbInvoice, CkbInvoiceStatus, InvoiceStore};
 use crate::store::{NodeNamespace, Store};
 
 use super::{
@@ -29,6 +30,11 @@ use super::{
     LspPaymentDeliveryStatus, TenantChannelRecord, TenantId, TenantRegistry, TenantRuntimeFactory,
     TenantRuntimeStatus, TenantSupervisor,
 };
+
+/// How long a delivery sent as a plain forward may show no TLC to the tenant before its upstream
+/// TLC is failed: the add reaches the tenant's channel within milliseconds, or fails the upstream
+/// TLC itself.
+const FORWARD_ADD_GRACE_MS: u64 = 60_000;
 
 /// Runtime dependencies of the LSP service container.
 pub struct LspServiceArgs {
@@ -677,14 +683,20 @@ impl Actor for LspService {
             LspServiceMessage::PaymentOutcomeReady(request, reply) => {
                 let PaymentOutcomeRequest {
                     payment_hash,
+                    upstream_tlcs,
                     payment_status,
                     failure,
                     failure_code,
                 } = request;
-                let result = match state
+                // The outcome is the delivery's only when the payment forwards its incoming TLC:
+                // another payment of Public T can end with the same hash.
+                let active = state
                     .delivery_manager
                     .get_active_by_payment_hash(&payment_hash)
-                {
+                    .map(|delivery| {
+                        delivery.filter(|delivery| forwards_delivery(&upstream_tlcs, delivery))
+                    });
+                let result = match active {
                     Ok(Some(delivery)) if !delivery.status.is_final() => {
                         let key = delivery.key();
                         let deadline = delivery.buffer_deadline;
@@ -709,7 +721,9 @@ impl Actor for LspService {
                         .delivery_manager
                         .get_active_by_payment_hash(&payment_hash)
                     {
-                        LspServiceState::schedule_reconciliation_retry(&myself, delivery.key());
+                        if forwards_delivery(&upstream_tlcs, &delivery) {
+                            LspServiceState::schedule_reconciliation_retry(&myself, delivery.key());
+                        }
                     }
                 }
                 let _ = reply.send(result);
@@ -717,12 +731,14 @@ impl Actor for LspService {
             LspServiceMessage::PaymentOutcomeSettled(outcome) => {
                 let SettledPaymentOutcome {
                     payment_hash,
+                    upstream_tlcs,
                     payment_status,
                     failure,
                 } = outcome;
                 if let Some(delivery) = state
                     .delivery_manager
                     .get_active_by_payment_hash(&payment_hash)?
+                    .filter(|delivery| forwards_delivery(&upstream_tlcs, delivery))
                 {
                     let key = delivery.key();
                     if !delivery.status.is_final() {
@@ -733,6 +749,12 @@ impl Actor for LspService {
         }
         Ok(())
     }
+}
+
+/// Whether a payment forwarding these incoming TLCs is the delivery's own.
+fn forwards_delivery(upstream_tlcs: &[(Hash256, u64)], delivery: &LspPaymentDelivery) -> bool {
+    let key = delivery.key();
+    upstream_tlcs.contains(&(key.incoming_channel_id, key.incoming_tlc_id))
 }
 
 impl LspService {
@@ -754,6 +776,101 @@ impl LspService {
             5_000
         )
         .map_err(|error| error.to_string())
+    }
+
+    async fn inspect_forward(
+        state: &LspServiceState,
+        delivery: &LspPaymentDelivery,
+    ) -> Result<HostedForwardStatus, String> {
+        ractor::call_t!(
+            state.public_network_actor,
+            |reply| NetworkActorMessage::new_command(FiberActorCommand::InspectHostedForward {
+                request: delivery.request.clone(),
+                reply,
+            }),
+            5_000
+        )
+        .map_err(|error| error.to_string())
+    }
+
+    /// Follow a delivery sent as a plain forward until the channels settle its upstream TLC with
+    /// the tenant's answer. Nothing is dispatched again from here: the upstream TLC went to the
+    /// tenant once, and the forward finishes on its own.
+    async fn resume_forwarded(
+        myself: &ActorRef<LspServiceMessage>,
+        state: &mut LspServiceState,
+        delivery: LspPaymentDelivery,
+    ) -> Result<(), String> {
+        let key = delivery.key();
+        let now = crate::now_timestamp_as_millis_u64();
+        let status = match Self::inspect_forward(state, &delivery).await {
+            Ok(status) => status,
+            Err(error) => {
+                tracing::warn!(
+                    payment_hash = %delivery.payment_hash,
+                    %error,
+                    "Failed to inspect a forwarded hosted delivery"
+                );
+                LspServiceState::schedule_reconciliation_retry(myself, key);
+                return Ok(());
+            }
+        };
+        const NOT_TAKEN: &str = "the tenant did not take the forwarded payment";
+        // Some(None): the tenant was paid. Some(Some(reason)): it was not.
+        let outcome = match status {
+            HostedForwardStatus::Fulfilled => Some(None),
+            HostedForwardStatus::Failed => Some(Some(NOT_TAKEN)),
+            HostedForwardStatus::Gone => {
+                // The removal was applied, which a fulfilled TLC reaches at once and a failed
+                // one only once both sides confirm it: ask the tenant's own invoice.
+                let paid = state
+                    .store
+                    .namespaced(NodeNamespace::hosted_tenant(delivery.tenant_id.as_str()))
+                    .get_invoice_status(&delivery.payment_hash)
+                    == Some(CkbInvoiceStatus::Paid);
+                Some((!paid).then_some(NOT_TAKEN))
+            }
+            HostedForwardStatus::NotForwarded
+                if now.saturating_sub(delivery.updated_at) >= FORWARD_ADD_GRACE_MS =>
+            {
+                // No TLC to the tenant came of the forward, and the upstream TLC is still
+                // pending: its add was lost. Fail the upstream TLC rather than hold it.
+                let reason = "the forward to the tenant was not added".to_string();
+                let delivery = state.delivery_manager.transition_with_error(
+                    &key,
+                    LspPaymentDeliveryStatus::SettlingUpstream {
+                        payment_status: PaymentStatus::Failed,
+                        failure: Some(reason.clone()),
+                    },
+                    Some((reason, Some(TlcErrorCode::TemporaryNodeFailure))),
+                    now,
+                )?;
+                return Self::finish_failed_delivery(myself, state, delivery).await;
+            }
+            HostedForwardStatus::NotForwarded
+            | HostedForwardStatus::Pending
+            | HostedForwardStatus::Unknown => None,
+        };
+        match outcome {
+            Some(None) => {
+                state.delivery_manager.transition(
+                    &key,
+                    LspPaymentDeliveryStatus::Succeeded,
+                    now,
+                )?;
+            }
+            Some(Some(reason)) => {
+                state.delivery_manager.transition(
+                    &key,
+                    LspPaymentDeliveryStatus::Failed {
+                        reason: reason.to_string(),
+                    },
+                    now,
+                )?;
+            }
+            None => LspServiceState::schedule_reconciliation_retry(myself, key),
+        }
+        Ok(())
     }
 
     fn fail_removed_delivery(
@@ -844,9 +961,14 @@ impl LspService {
         if delivery.status.is_final() {
             return Ok(());
         }
+        if delivery.status == LspPaymentDeliveryStatus::Forwarded {
+            return Self::resume_forwarded(&myself, state, delivery).await;
+        }
         // A deferred delivery has not created its downstream payment session yet. Looking up the
         // hash at that point can find the upstream trampoline session and incorrectly treat it as
-        // the downstream delivery. Only reconcile a session after dispatch has actually started.
+        // the downstream delivery. Only reconcile a session after dispatch has actually started,
+        // and only the session that forwards this delivery's incoming TLC: another payment of
+        // Public T can hold the same hash.
         if matches!(
             delivery.status,
             LspPaymentDeliveryStatus::Dispatching
@@ -855,12 +977,33 @@ impl LspService {
         ) {
             let existing_payment = ractor::call_t!(
                 state.public_network_actor,
-                |reply| NetworkActorMessage::new_command(FiberActorCommand::GetPayment(
-                    payment_hash,
-                    reply,
-                )),
+                |reply| NetworkActorMessage::new_command(
+                    FiberActorCommand::GetHostedDeliveryPayment {
+                        request: delivery.request.clone(),
+                        reply,
+                    }
+                ),
                 5_000
             );
+            // No session pays it: it may have gone as a plain forward whose dispatch answer was
+            // lost (a restart, a timed out call).
+            if !matches!(existing_payment, Ok(Ok(_)))
+                && matches!(
+                    delivery.status,
+                    LspPaymentDeliveryStatus::Dispatching | LspPaymentDeliveryStatus::InFlight
+                )
+                && matches!(
+                    Self::inspect_forward(state, &delivery).await,
+                    Ok(HostedForwardStatus::Pending | HostedForwardStatus::Fulfilled)
+                )
+            {
+                let delivery = state.delivery_manager.transition(
+                    &key,
+                    LspPaymentDeliveryStatus::Forwarded,
+                    crate::now_timestamp_as_millis_u64(),
+                )?;
+                return Self::resume_forwarded(&myself, state, delivery).await;
+            }
             if let Ok(Ok(payment)) = existing_payment {
                 if payment.status.is_final() {
                     let decision = state.record_payment_outcome(
@@ -1013,12 +1156,25 @@ impl LspService {
             }),
         };
         match dispatch_result {
-            Ok(()) => {
+            Ok(HostedDispatch::Payment) => {
                 state.delivery_manager.transition(
                     &key,
                     LspPaymentDeliveryStatus::InFlight,
                     crate::now_timestamp_as_millis_u64(),
                 )?;
+            }
+            Ok(HostedDispatch::Forward) => {
+                tracing::info!(
+                    %payment_hash,
+                    tenant_id = %delivery.tenant_id,
+                    "Hosted delivery forwarded: another payment holds its hash"
+                );
+                state.delivery_manager.transition(
+                    &key,
+                    LspPaymentDeliveryStatus::Forwarded,
+                    crate::now_timestamp_as_millis_u64(),
+                )?;
+                LspServiceState::schedule_reconciliation_retry(&myself, key);
             }
             Err(DeliveryDispatchError::Temporary { reason }) => {
                 state.delivery_manager.transition_with_error(
@@ -1062,7 +1218,11 @@ impl LspService {
             return Ok(());
         };
         let payment_hash = delivery.payment_hash;
-        if matches!(delivery.status, LspPaymentDeliveryStatus::InFlight) {
+        // Sent on: the tenant's answer settles the upstream TLC, not the buffer deadline.
+        if matches!(
+            delivery.status,
+            LspPaymentDeliveryStatus::InFlight | LspPaymentDeliveryStatus::Forwarded
+        ) {
             return Ok(());
         }
         if delivery.status.is_final() {
