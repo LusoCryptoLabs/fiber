@@ -335,6 +335,76 @@ impl StoreBatch {
     }
 }
 
+/// Striped locks keyed by channel id. A channel state write reads the hashes indexed for the
+/// channel and commits the new ones with the state, so two writes of one channel must not
+/// interleave. One set per process, shared by every store and namespace.
+struct ChannelIndexLocks([parking_lot::Mutex<()>; 64]);
+
+static CHANNEL_INDEX_LOCKS: ChannelIndexLocks =
+    ChannelIndexLocks([const { parking_lot::const_mutex(()) }; 64]);
+
+impl ChannelIndexLocks {
+    fn stripe(&self, channel_id: &Hash256) -> usize {
+        channel_id.as_ref()[0] as usize % self.0.len()
+    }
+
+    fn lock(&self, channel_id: &Hash256) -> parking_lot::MutexGuard<'_, ()> {
+        self.0[self.stripe(channel_id)].lock()
+    }
+
+    /// Lock the stripes of two channels in a fixed order.
+    fn lock_pair(
+        &self,
+        a: &Hash256,
+        b: &Hash256,
+    ) -> (
+        parking_lot::MutexGuard<'_, ()>,
+        Option<parking_lot::MutexGuard<'_, ()>>,
+    ) {
+        let (a, b) = (self.stripe(a), self.stripe(b));
+        if a == b {
+            return (self.0[a].lock(), None);
+        }
+        let (first, second) = if a < b { (a, b) } else { (b, a) };
+        let first = self.0[first].lock();
+        (first, Some(self.0[second].lock()))
+    }
+}
+
+impl Store {
+    /// The payment hashes currently indexed for a channel, sorted.
+    fn indexed_payment_hashes(&self, channel_id: &Hash256) -> Vec<Hash256> {
+        self.get(channel_payment_hashes_key(channel_id))
+            .map(|value| deserialize_from(value.as_ref(), "ChannelPaymentHashes"))
+            .unwrap_or_default()
+    }
+
+    /// Stage the index rows that change the indexed hashes of a channel from `old` to `new`.
+    fn stage_payment_hash_index(
+        batch: &mut StoreBatch,
+        channel_id: &Hash256,
+        old: &[Hash256],
+        new: &std::collections::BTreeSet<Hash256>,
+    ) {
+        if old.len() == new.len() && old.iter().eq(new.iter()) {
+            return;
+        }
+        for hash in old.iter().filter(|hash| !new.contains(hash)) {
+            batch.delete(payment_hash_channel_id_key(hash, channel_id));
+        }
+        for hash in new.iter().filter(|hash| old.binary_search(hash).is_err()) {
+            batch.put(payment_hash_channel_id_key(hash, channel_id), []);
+        }
+        let key = channel_payment_hashes_key(channel_id);
+        if new.is_empty() {
+            batch.delete(key);
+        } else {
+            let hashes: Vec<Hash256> = new.iter().copied().collect();
+            batch.put(key, serialize_to_vec(&hashes, "ChannelPaymentHashes"));
+        }
+    }
+}
+
 impl BatchWriter for StoreBatch {
     fn put<K: AsRef<[u8]>, V: AsRef<[u8]>>(&mut self, key: K, value: V) {
         self.inner.put(self.physical_key(key.as_ref()), value)
@@ -584,7 +654,14 @@ pub fn check_validate<P: AsRef<Path>>(path: P) -> Result<(), String> {
             INVOICE_PREIMAGE_PREFIX => {
                 check_deserialization::<()>(&value, "INVOICE_PREIMAGE_PREFIX", &mut errors);
             }
-            PUBKEY_CHANNEL_ID_PREFIX => {}
+            PUBKEY_CHANNEL_ID_PREFIX | PAYMENT_HASH_CHANNEL_ID_PREFIX => {}
+            CHANNEL_PAYMENT_HASHES_PREFIX => {
+                check_deserialization::<Vec<Hash256>>(
+                    &value,
+                    "CHANNEL_PAYMENT_HASHES_PREFIX",
+                    &mut errors,
+                );
+            }
             CHANNEL_OUTPOINT_CHANNEL_ID_PREFIX => {
                 check_deserialization::<Hash256>(
                     &value,
@@ -1357,7 +1434,14 @@ impl ChannelActorStateStore for Store {
 
     fn insert_channel_actor_state(&self, mut state: ChannelActorState) {
         state.clear_local_signer_material();
+        let _guard = CHANNEL_INDEX_LOCKS.lock(&state.id);
         let mut batch = self.batch();
+        Self::stage_payment_hash_index(
+            &mut batch,
+            &state.id,
+            &self.indexed_payment_hashes(&state.id),
+            &state.pending_payment_hashes(),
+        );
 
         let kv = KeyValue::PubkeyChannelId((state.get_remote_pubkey(), state.id), state.state);
         batch.put(kv.key(), kv.value());
@@ -1377,8 +1461,21 @@ impl ChannelActorStateStore for Store {
             return;
         }
 
+        let _guards = CHANNEL_INDEX_LOCKS.lock_pair(old_id, &state.id);
         let old_state = self.get_channel_actor_state(old_id);
         let mut batch = self.batch();
+        Self::stage_payment_hash_index(
+            &mut batch,
+            old_id,
+            &self.indexed_payment_hashes(old_id),
+            &Default::default(),
+        );
+        Self::stage_payment_hash_index(
+            &mut batch,
+            &state.id,
+            &self.indexed_payment_hashes(&state.id),
+            &state.pending_payment_hashes(),
+        );
 
         if let Some(old_state) = old_state {
             batch.delete([&[CHANNEL_ACTOR_STATE_PREFIX], old_id.as_ref()].concat());
@@ -1408,8 +1505,15 @@ impl ChannelActorStateStore for Store {
     }
 
     fn delete_channel_actor_state(&self, id: &Hash256) {
+        let _guard = CHANNEL_INDEX_LOCKS.lock(id);
         if let Some(state) = self.get_channel_actor_state(id) {
             let mut batch = self.batch();
+            Self::stage_payment_hash_index(
+                &mut batch,
+                id,
+                &self.indexed_payment_hashes(id),
+                &Default::default(),
+            );
             batch.delete([&[CHANNEL_ACTOR_STATE_PREFIX], id.as_ref()].concat());
             let remote_pubkey_bytes = state.get_remote_pubkey().serialize();
             batch.delete(
@@ -1463,6 +1567,24 @@ impl ChannelActorStateStore for Store {
                 (pubkey, channel_id.into(), state)
             })
             .collect()
+    }
+
+    fn other_channel_has_pending_payment_hash(
+        &self,
+        payment_hash: &Hash256,
+        channel_id: &Hash256,
+    ) -> bool {
+        let prefix = [&[PAYMENT_HASH_CHANNEL_ID_PREFIX][..], payment_hash.as_ref()].concat();
+        let take_prefix = prefix.clone();
+        // Two rows are enough: at most one of them is the excluded channel.
+        self.collect_iterator(
+            prefix,
+            IteratorDirection::Forward,
+            Box::new(move |key| key.starts_with(&take_prefix)),
+            2,
+        )
+        .into_iter()
+        .any(|kv| kv.key.get(33..) != Some(channel_id.as_ref()))
     }
 
     fn get_channel_state_by_outpoint(&self, outpoint: &OutPoint) -> Option<ChannelActorState> {

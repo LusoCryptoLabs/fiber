@@ -1834,6 +1834,19 @@ pub struct ChannelActorData {
     pub session: ChannelSessionV2,
 }
 
+impl ChannelActorData {
+    /// Payment hashes of the TLCs and V2 remove effects this channel still records.
+    ///
+    /// A preimage is kept while any channel lists its hash here.
+    pub fn pending_payment_hashes(&self) -> std::collections::BTreeSet<Hash256> {
+        self.tlc_state
+            .all_tlcs()
+            .chain(self.session.remove_effects.iter().map(|(tlc, _)| tlc))
+            .map(|tlc| tlc.payment_hash)
+            .collect()
+    }
+}
+
 impl From<PubNonce> for molecule_fiber::PubNonce {
     fn from(value: PubNonce) -> Self {
         molecule_fiber::PubNonce::from_slice(value.to_bytes().as_ref())
